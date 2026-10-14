@@ -87,54 +87,68 @@ NSE_STOCKS = [
 ]
 
 def scan_stock(symbol, days_back=1):
-    """Scan stock for VCP breakouts"""
+    """Scan stock for VCP breakouts (MONTHLY DATA)"""
     try:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=365)
-        data = yf.download(symbol, start=start_date, end=end_date, progress=False)
-        
+
+        # Fetch MONTHLY data
+        data = yf.download(symbol, start=start_date, end=end_date, interval='1mo', progress=False)
+
         if data is None or len(data) < 4:
             return []
-        
+
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
-        
-        data['Range'] = (data['Open'] - data['Close']).abs()
-        
+
+        # Calculate monthly range (High - Low for the month)
+        data['Range'] = data['High'] - data['Low']
+
         breakouts = []
-        check_from_index = max(3, len(data) - days_back)
-        
-        for i in range(check_from_index, len(data)):
-            today = data.iloc[i]
-            day1 = data.iloc[i-1]
-            day2 = data.iloc[i-2]
-            day3 = data.iloc[i-3]
-            
-            today_range = float(today['Range'])
-            today_vol = float(today['Volume'])
-            
-            d1_range = float(day1['Range'])
-            d2_range = float(day2['Range'])
-            d3_range = float(day3['Range'])
-            
-            d1_vol = float(day1['Volume'])
-            d2_vol = float(day2['Volume'])
-            d3_vol = float(day3['Volume'])
-            
-            range_3days = d1_range + d2_range + d3_range
-            vol_3days = d1_vol + d2_vol + d3_vol
-            
-            if today_range > range_3days and today_vol > vol_3days:
-                range_ratio = today_range / range_3days if range_3days > 0 else 0
-                vol_ratio = today_vol / vol_3days if vol_3days > 0 else 0
-                
+
+        # Need at least 4 months of data (current + 3 previous)
+        if len(data) >= 4:
+            i = len(data) - 1  # Current (latest) month
+
+            current_month = data.iloc[i]
+            prev_month_1 = data.iloc[i-1]
+            prev_month_2 = data.iloc[i-2]
+            prev_month_3 = data.iloc[i-3]
+
+            current_range = float(current_month['Range'])
+            current_vol = float(current_month['Volume'])
+
+            # Last 3 months
+            prev_range_1 = float(prev_month_1['Range'])
+            prev_range_2 = float(prev_month_2['Range'])
+            prev_range_3 = float(prev_month_3['Range'])
+
+            prev_vol_1 = float(prev_month_1['Volume'])
+            prev_vol_2 = float(prev_month_2['Volume'])
+            prev_vol_3 = float(prev_month_3['Volume'])
+
+            # Condition 1: Current range > sum of last 3 months' ranges
+            sum_prev_ranges = prev_range_1 + prev_range_2 + prev_range_3
+
+            # Condition 2: Current volume >= 2x average of last 3 months
+            avg_prev_vol = (prev_vol_1 + prev_vol_2 + prev_vol_3) / 3
+            double_avg_vol = avg_prev_vol * 2
+
+            if current_range > sum_prev_ranges and current_vol >= double_avg_vol:
+                range_ratio = current_range / sum_prev_ranges if sum_prev_ranges > 0 else 0
+                vol_ratio = current_vol / double_avg_vol if double_avg_vol > 0 else 0
+
                 breakouts.append({
                     'Date': data.index[i].strftime('%Y-%m-%d'),
-                    'Price': float(today['Close']),
+                    'Price': float(current_month['Close']),
                     'Range_Ratio': range_ratio,
-                    'Vol_Ratio': vol_ratio
+                    'Vol_Ratio': vol_ratio,
+                    'Current_Range': current_range,
+                    'Sum_3Mo_Range': sum_prev_ranges,
+                    'Current_Vol': current_vol,
+                    'Double_3Mo_Avg': double_avg_vol
                 })
-        
+
         return breakouts
     except Exception as e:
         print(f"Error scanning {symbol}: {e}")
@@ -170,7 +184,9 @@ def send_email(results_df, total_stocks_scanned):
                 <p><b>Breakouts:</b> {len(results_df)}</p>
                 {html_table}
                 <div class="footer">
-                    <p>📊 Formula: Today's Range > Sum(Last 3 Days) AND Volume > Sum(Last 3 Days)</p>
+                    <p>📊 Formula (MONTHLY):</p>
+                    <p>✓ Condition 1: Current Month Range > Sum(Last 3 Months' Ranges)</p>
+                    <p>✓ Condition 2: Current Month Volume ≥ 2x Average(Last 3 Months' Volumes)</p>
                 </div>
             </body>
             </html>
@@ -204,18 +220,22 @@ def main():
     print(f"Scanning {len(NSE_STOCKS)} stocks...\n")
     
     all_results = []
-    
+
     for i, symbol in enumerate(NSE_STOCKS):
         print(f"[{i+1:3d}/{len(NSE_STOCKS)}] {symbol:15s}", end='\r')
         breakouts = scan_stock(symbol, days_back=DAYS_TO_CHECK)
-        
+
         for bo in breakouts:
             all_results.append({
                 'Stock': symbol.replace('.NS', ''),
                 'Date': bo['Date'],
                 'Price': f"₹{bo['Price']:.2f}",
-                'Range_Ratio': f"{bo['Range_Ratio']:.2f}x",
-                'Vol_Ratio': f"{bo['Vol_Ratio']:.2f}x"
+                'Curr_Range': f"₹{bo['Current_Range']:.2f}",
+                'Sum_3Mo': f"₹{bo['Sum_3Mo_Range']:.2f}",
+                'Range_Check': f"✓ {bo['Range_Ratio']:.2f}x",
+                'Curr_Vol': f"{bo['Current_Vol']:,.0f}",
+                'Req_Vol': f"{bo['Double_3Mo_Avg']:,.0f}",
+                'Vol_Check': f"✓ {bo['Vol_Ratio']:.2f}x"
             })
     
     print(" " * 120)
