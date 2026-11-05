@@ -1,260 +1,296 @@
 #!/usr/bin/env python3
 """
-VCP SCREENER - GITHUB ACTIONS VERSION
-Runs on GitHub servers daily, emails results
+VCP MONTHLY SCREENER v2 - live scan + custom-range backtest
+
+Usage:
+  python vcp_monthly_screener_v2.py live
+  python vcp_monthly_screener_v2.py backtest --start 2025-01-01 --end 2026-09-30
+
+Only COMPLETED months are evaluated (the in-progress month is always dropped).
+
+For every stock and every completed month, with prev3 = the 3 months before it:
+  STRICT  : range > sum(prev3 ranges)          AND volume >= 2.0 x avg(prev3 volumes)
+            (your original rule)
+  RELAXED : range > avg(prev3 ranges)          AND volume >= 1.5 x avg(prev3 volumes)
+  RANK    : filler only. If a month has fewer than MIN_PICKS_PER_MONTH STRICT/RELAXED
+            names, the highest-scoring remaining names are shown and tagged RANK.
+            RANK rows are NOT breakout signals.
+
+Score = (range / sum(prev3 ranges)) * (volume / avg(prev3 volumes))
 """
 
-import yfinance as yf
-import pandas as pd
-from datetime import datetime, timedelta
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import warnings
+import argparse
+import io
 import os
-warnings.filterwarnings('ignore')
+import smtplib
+import sys
+import time
+from datetime import date
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
-SENDER_EMAIL = os.getenv('SENDER_EMAIL', '')
-SENDER_PASSWORD = os.getenv('SENDER_PASSWORD', '')
-RECIPIENT_EMAIL = os.getenv('RECIPIENT_EMAIL', SENDER_EMAIL)
+import numpy as np
+import pandas as pd
+import requests
+import yfinance as yf
 
-# 350+ NSE STOCKS - Large Cap + Mid Cap + Small Cap Coverage
-NSE_STOCKS = [
-    # NIFTY 50 (50 stocks)
-    'RELIANCE.NS', 'TCS.NS', 'INFY.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'LT.NS', 'MARUTI.NS',
-    'BAJAJ-AUTO.NS', 'SUNPHARMA.NS', 'ASIANPAINT.NS', 'WIPRO.NS', 'TECHM.NS', 'ULTRACEMCO.NS',
-    'POWERGRID.NS', 'JSWSTEEL.NS', 'BHARTIARTL.NS', 'SBILIFE.NS', 'INDUSIND.NS', 'AXIS.NS',
-    'BAJAJFINSV.NS', 'TATACONSUM.NS', 'TITAN.NS', 'HINDALCO.NS', 'TATASTEEL.NS', 'APOLLOHOSP.NS',
-    'ONGC.NS', 'NTPC.NS', 'IOC.NS', 'GAIL.NS', 'BPCL.NS', 'COALINDIA.NS', 'HEROMOTOCO.NS',
-    'M&M.NS', 'TATAPOWER.NS', 'EICHERMOT.NS', 'ADANIPORTS.NS', 'ADANIGREEN.NS', 'ADANIPOWER.NS',
-    'ADANITRANS.NS', 'GODREJCP.NS', 'BRITANNIA.NS', 'MARICO.NS', 'NESTLEIND.NS', 'DABUR.NS',
-    'COLPAL.NS', 'SBIN.NS', 'HDFC.NS',
+# ----------------------------- CONFIG -----------------------------
+LOOKBACK = 3                  # months in the comparison window
+STRICT_VOL_MULT = 2.0         # strict: volume >= 2.0 x avg(prev3)
+RELAXED_RANGE_FRAC = 1 / 3    # relaxed: range > (1/3) x sum(prev3) = avg(prev3)
+RELAXED_VOL_MULT = 1.5        # relaxed: volume >= 1.5 x avg(prev3)
+MIN_PICKS_PER_MONTH = 3       # guarantee at least this many rows per month (RANK fills the gap)
+REQUEST_PAUSE_SEC = 0.1       # be gentle with Yahoo
 
-    # NIFTY NEXT 50 (50 stocks)
-    'HCLTECH.NS', 'PERSISTENT.NS', 'PAGEIND.NS', 'BERGEPAINT.NS', 'DIVISLAB.NS', 'LUPIN.NS',
-    'DRREDDY.NS', 'CIPLA.NS', 'BOSCHLTD.NS', 'AMBUJACEM.NS', 'SHREECEM.NS', 'GLAND.NS',
-    'ALKEM.NS', 'CADILAHC.NS', 'AUROPHARM.NS', 'NATIONALUM.NS', 'JINDALSTEL.NS', 'SAIL.NS',
-    'VEDANTA.NS', 'RATNAMANI.NS', 'THERMAX.NS', 'KIRLOSKAR.NS', 'GMRINFRA.NS', 'IRFC.NS',
-    'IDFCFIRSTB.NS', 'MINDTREE.NS', 'INFIBEAM.NS', 'NAUKRI.NS', 'ZOMATO.NS', 'PAYTM.NS',
-    'NYKAA.NS', 'MANYAVAR.NS', 'RELAXO.NS', 'BATA.NS', 'POLYCAB.NS', 'HAVELLS.NS',
-    'SIEMENS.NS', 'SCHNEIDER.NS', 'ABB.NS', 'CROMPTON.NS', 'GRAPHITE.NS', 'CUMMINSIND.NS',
-    'LASGRUP.NS', 'MEDPLUS.NS', 'MUTHOOTFIN.NS', 'KPITTECH.NS', 'KALYANKJIL.NS', 'IPCALAB.NS',
-    'BALRAMCHIN.NS', 'CASTROLIND.NS',
+NSE_INDEX_LISTS = {
+    'Nifty 50': 'https://archives.nseindia.com/content/indices/ind_nifty50list.csv',
+    'Nifty Next 50': 'https://archives.nseindia.com/content/indices/ind_niftynext50list.csv',
+    'Nifty Midcap 150': 'https://archives.nseindia.com/content/indices/ind_niftymidcap150list.csv',
+    'Nifty Smallcap 250': 'https://archives.nseindia.com/content/indices/ind_niftysmallcap250list.csv',
+}
+NSE_HEADERS = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)', 'Accept': 'text/csv,*/*'}
 
-    # NIFTY MIDCAP 50 (50 stocks)
-    'MEESHO.NS', 'ASTRAL.NS', 'SUMITOMO.NS', 'BANCAIND.NS', 'BANKINDIA.NS', 'BASF.NS',
-    'BEML.NS', 'BIRLACORP.NS', 'BLUESTARCO.NS', 'CAIRN.NS', 'CANBANK.NS', 'CANBK.NS',
-    'CARBORUNDUM.NS', 'CEATLTD.NS', 'CENTURAPLAST.NS', 'CERA.NS', 'CGPOWER.NS', 'CHAMBLFERT.NS',
-    'CHEMCON.NS', 'CHEMPLASTS.NS', 'CHEVRON.NS', 'CHLORIDES.NS', 'CHOICEIN.NS', 'CICEYL.NS',
-    'COFFEDAY.NS', 'COLEURPK.NS', 'CONCENTR.NS', 'CONCOR.NS', 'CONFORGE.NS', 'CONTROLPRE.NS',
-    'COOKWELD.NS', 'COPILOTTECH.NS', 'CORELUC.NS', 'COREMETR.NS', 'CORESTONE.NS', 'CORESEED.NS',
-    'COREU.NS', 'COREVTX.NS', 'CORGANO.NS', 'CORNED.NS', 'CORTECH.NS', 'CORONA.NS',
-    'CORPFINE.NS', 'CORPFOCUS.NS', 'CORPFOOD.NS', 'CORPIRON.NS', 'CORPRES.NS', 'CORSEED.NS',
-
-    # NIFTY SMALLCAP 50 (50 stocks)
-    'CAPPL.NS', 'CCLAUTOMOTIVE.NS', 'CDSL.NS', 'CFSL.NS', 'CLARIANT.NS', 'CRAFTSMAN.NS',
-    'DBL.NS', 'DCMSRMF.NS', 'DEEPAKFERT.NS', 'DEEPAKNTR.NS', 'DELHIVERY.NS', 'DELTACORP.NS',
-    'DHANI.NS', 'DIAMONDYD.NS', 'DHUNINV.NS', 'DISHTV.NS', 'DIVULG.NS', 'DLINDIA.NS',
-    'DMART.NS', 'DRAREDIBLE.NS', 'DRAJIT.NS', 'DREAMLAND.NS', 'DRREDDY.NS', 'DSQUALITY.NS',
-    'DTE.NS', 'DTIL.NS', 'DTNK.NS', 'DUCENINF.NS', 'DURATHERM.NS', 'DVPL.NS',
-    'DWSIL.NS', 'DYNAMATECH.NS', 'DYNPRO.NS', 'ECLERX.NS', 'ECOTEXTILES.NS', 'EDELWEISS.NS',
-    'EDUCOMP.NS', 'EDENRED.NS', 'EDSERDA.NS', 'EICHERMOT.NS', 'EIGENCOMP.NS', 'EINDIA.NS',
-    'ELCID.NS', 'ELECTROSTEEL.NS', 'ELECON.NS', 'ELGIEQUIP.NS', 'EMAMIPOUJI.NS',
-
-    # Additional Small Caps & High Conviction Stocks
-    'EMKAY.NS', 'ENCOREFILM.NS', 'ENDURANCE.NS', 'ENERGYDEV.NS', 'ENGINERDS.NS', 'ENGITECH.NS',
-    'ENPLUSBL.NS', 'ENSEMBLEIT.NS', 'ENTEL.NS', 'ENTERO.NS', 'ENTNETWORK.NS', 'ENTROTECH.NS',
-    'ENTRUST.NS', 'ENVIRO.NS', 'ENVIROTECH.NS', 'ENWL.NS', 'EOPV.NS', 'EPITECH.NS',
-    'EQUAL.NS', 'EQUATIONS.NS', 'EQUIPPP.NS', 'EQSIS.NS', 'EQUIV.NS', 'ERECTTECH.NS',
-    'ERGLASSG.NS', 'ERIHOSPITAL.NS', 'ERIVET.NS', 'ERNUM.NS', 'EROSION.NS', 'EROT.NS',
-    'ERRBANKLTD.NS', 'ERRA.NS', 'ESAB.NS', 'ESAFETY.NS', 'ESCROW.NS', 'ESIXMEDIA.NS',
-    'ESKAYFILMS.NS', 'ESPL.NS', 'ESS.NS', 'ESSARK.NS', 'ESSCO.NS', 'ESSEMINERALS.NS',
-    'ESSEQUANT.NS', 'ESSETTAYA.NS', 'ESSENTIAL.NS', 'ESSPLASTIC.NS', 'ESTATESINT.NS',
-    'ESTEELA.NS', 'ESTEESURGICALS.NS', 'ESTEEROPE.NS', 'ESTERNOTE.NS', 'ESTETOL.NS',
-    'ESTETRADE.NS', 'ESTERNORTH.NS', 'ESTIND.NS', 'ESTIRAUM.NS', 'ESTJAL.NS', 'ESTJOYD.NS',
-    'ESTLAUNCH.NS', 'ESTLIBER.NS', 'ESTLOCK.NS', 'ESTLUD.NS', 'ESTLYN.NS', 'ESTMAAR.NS',
-    'ESTMAGMA.NS', 'ESTMAJ.NS', 'ESTMAJOR.NS', 'ESTMALL.NS', 'ESTMANAGE.NS', 'ESTMARK.NS',
-    'ESTMARSHAL.NS', 'ESTMAS.NS', 'ESTMATER.NS', 'ESTMATL.NS', 'ESTMAX.NS', 'ESTMAYA.NS',
-    'ESTMAYIL.NS', 'ESTMAZA.NS', 'ESTMB.NS', 'ESTMCL.NS', 'ESTMDS.NS', 'ESTME.NS',
-    'ESTMEALS.NS', 'ESTMED.NS', 'ESTMEDIA.NS', 'ESTMEDS.NS', 'ESTMEGA.NS', 'ESTMEGRI.NS',
-    'ESTMEL.NS', 'ESTMELIA.NS', 'ESTMEM.NS', 'ESTMEMES.NS', 'ESTMEN.NS', 'ESTMEND.NS',
-    'ESTMENUS.NS', 'ESTMEP.NS', 'ESTMEPS.NS', 'ESTMEQUIP.NS', 'ESTMER.NS', 'ESTMERCE.NS',
-    'ESTMERC.NS', 'ESTMERCIL.NS', 'ESTMERCY.NS', 'ESTMERD.NS', 'ESTMERE.NS', 'ESTMEREX.NS',
-    'ESTMERGA.NS', 'ESTMERGY.NS', 'ESTMERIT.NS', 'ESTMERIT2.NS', 'ESTMERLA.NS', 'ESTMEROUS.NS',
-    'ESTMERS.NS', 'ESTMERSA.NS', 'ESTMERSE.NS', 'ESTMERSI.NS', 'ESTMERSIL.NS', 'ESTMERSION.NS',
-    'ESTMERST.NS', 'ESTMERSUL.NS', 'ESTMERT.NS', 'ESTMERTH.NS', 'ESTMERTI.NS', 'ESTMERTILE.NS',
-    'ESTMERTIL.NS', 'ESTMERTIN.NS', 'ESTMERTLE.NS', 'ESTMERTLY.NS', 'ESTMERTS.NS', 'ESTMERTU.NS',
-    'ESTMERU.NS', 'ESTMERV.NS', 'ESTMERVE.NS', 'ESTMERVES.NS', 'ESTMERVIA.NS', 'ESTMERVIN.NS',
-    'ESTMERVIO.NS', 'ESTMERVIR.NS', 'ESTMERVIS.NS', 'ESTMERVIT.NS', 'ESTMERVIV.NS', 'ESTMERVY.NS',
-    'ESTMERY.NS', 'ESTMESA.NS', 'ESTMESAL.NS', 'ESTMESAN.NS', 'ESTMESARA.NS', 'ESTMESARE.NS',
-    'ESTMESARIN.NS', 'ESTMESARL.NS', 'ESTMESART.NS', 'ESTMESAS.NS', 'ESTMESAT.NS', 'ESTMESATA.NS',
+# Used ONLY if the NSE index files cannot be downloaded.
+FALLBACK_UNIVERSE = [
+    'ADANIENT', 'ADANIPORTS', 'APOLLOHOSP', 'ASIANPAINT', 'AXISBANK', 'BAJAJ-AUTO', 'BAJFINANCE',
+    'BAJAJFINSV', 'BEL', 'BHARTIARTL', 'BPCL', 'BRITANNIA', 'CIPLA', 'COALINDIA', 'DRREDDY',
+    'EICHERMOT', 'ETERNAL', 'GRASIM', 'HCLTECH', 'HDFCBANK', 'HDFCLIFE', 'HEROMOTOCO', 'HINDALCO',
+    'HINDUNILVR', 'ICICIBANK', 'INDUSINDBK', 'INFY', 'ITC', 'JIOFIN', 'JSWSTEEL', 'KOTAKBANK', 'LT',
+    'M&M', 'MARUTI', 'NESTLEIND', 'NTPC', 'ONGC', 'POWERGRID', 'RELIANCE', 'SBILIFE', 'SBIN',
+    'SHRIRAMFIN', 'SUNPHARMA', 'TATACONSUM', 'TATAMOTORS', 'TATASTEEL', 'TCS', 'TECHM', 'TITAN',
+    'TRENT', 'ULTRACEMCO', 'WIPRO', 'POLYCAB', 'PAGEIND', 'BERGEPAINT', 'DIVISLAB', 'LUPIN',
+    'BOSCHLTD', 'AMBUJACEM', 'SHREECEM', 'ALKEM', 'AUROPHARM', 'NATIONALUM', 'JINDALSTEL', 'SAIL',
+    'VEDL', 'THERMAX', 'IRFC', 'IDFCFIRSTB', 'NAUKRI', 'PAYTM', 'NYKAA', 'HAVELLS', 'SIEMENS', 'ABB',
+    'CROMPTON', 'CUMMINSIND', 'MUTHOOTFIN', 'KPITTECH', 'KALYANKJIL', 'IPCALAB', 'ASTRAL',
+    'BLUESTARCO', 'CGPOWER', 'CONCOR', 'CEATLTD', 'COFORGE', 'DEEPAKNTR', 'DMART', 'MEESHO',
+    'PERSISTENT', 'PIDILITIND', 'HAL', 'BHEL', 'IRCTC', 'TATAPOWER', 'ADANIGREEN', 'ADANIPOWER',
+    'GODREJCP', 'MARICO', 'DABUR', 'COLPAL', 'HDFCAMC', 'MAXHEALTH', 'LTIM', 'PRESTIGE',
+    'OBEROIRLTY', 'GODREJPROP', 'SUZLON', 'RVNL', 'IREDA', 'ZYDUSLIFE', 'TORNTPHARM',
 ]
 
-def scan_stock(symbol, days_back=1):
-    """Scan stock for VCP breakouts (MONTHLY DATA)"""
+
+# ----------------------------- UNIVERSE -----------------------------
+def load_universe():
+    """Pull current constituents of Nifty 50 / Next 50 / Midcap 150 / Smallcap 250 from NSE."""
+    symbols = set()
+    for name, url in NSE_INDEX_LISTS.items():
+        try:
+            resp = requests.get(url, headers=NSE_HEADERS, timeout=20)
+            resp.raise_for_status()
+            df = pd.read_csv(io.StringIO(resp.text))
+            syms = df['Symbol'].dropna().astype(str).str.strip()
+            symbols.update(f"{s}.NS" for s in syms)
+            print(f"  {name:20s} {len(syms)} symbols")
+        except Exception as exc:
+            print(f"  {name:20s} download failed ({exc})")
+    if not symbols:
+        print("  NSE lists unavailable -> using built-in fallback universe")
+        symbols = {f"{s}.NS" for s in FALLBACK_UNIVERSE}
+    return sorted(symbols)
+
+
+# ----------------------------- DATA -----------------------------
+def fetch_monthly(symbol, fetch_start, fetch_end, cutoff):
+    """Monthly OHLCV, keeping only months that fully closed on or before `cutoff`."""
     try:
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=365)
+        raw = yf.Ticker(symbol).history(start=fetch_start, end=fetch_end,
+                                        interval='1mo', auto_adjust=False)
+    except Exception:
+        return None
+    if raw is None or raw.empty:
+        return None
 
-        # Fetch MONTHLY data
-        data = yf.download(symbol, start=start_date, end=end_date, interval='1mo', progress=False)
+    df = raw[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+    idx = pd.DatetimeIndex(df.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    df.index = idx
 
-        if data is None or len(data) < 4:
-            return []
+    month_end = idx.to_period('M').end_time.normalize()
+    closed = np.asarray(month_end <= cutoff)
+    df = df[closed]
+    return df if len(df) > LOOKBACK else None
 
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
 
-        # Calculate monthly range (High - Low for the month)
-        data['Range'] = data['High'] - data['Low']
+# ----------------------------- LOGIC -----------------------------
+def evaluate(df, symbol, start, end):
+    """One row per completed month in [start, end] that has LOOKBACK prior months."""
+    rows = []
+    rng = (df['High'] - df['Low']).to_numpy(dtype=float)
+    vol = df['Volume'].to_numpy(dtype=float)
+    close = df['Close'].to_numpy(dtype=float)
+    months = df.index
 
-        breakouts = []
+    for i in range(LOOKBACK, len(df)):
+        month = months[i]
+        if month < start or month > end:
+            continue
 
-        # Need at least 4 months of data (current + 3 previous)
-        if len(data) >= 4:
-            i = len(data) - 1  # Current (latest) month
+        cur_r, cur_v = rng[i], vol[i]
+        sum_r = rng[i - LOOKBACK:i].sum()
+        avg_v = vol[i - LOOKBACK:i].mean()
+        if sum_r <= 0 or avg_v <= 0:
+            continue
 
-            current_month = data.iloc[i]
-            prev_month_1 = data.iloc[i-1]
-            prev_month_2 = data.iloc[i-2]
-            prev_month_3 = data.iloc[i-3]
+        c1 = cur_r > sum_r                          # range condition (your rule)
+        c2 = cur_v >= STRICT_VOL_MULT * avg_v       # volume condition (your rule)
+        relaxed = (cur_r > RELAXED_RANGE_FRAC * sum_r) and (cur_v >= RELAXED_VOL_MULT * avg_v)
 
-            current_range = float(current_month['Range'])
-            current_vol = float(current_month['Volume'])
+        range_vs_sum = cur_r / sum_r
+        vol_vs_avg = cur_v / avg_v
+        rows.append({
+            'month': month,
+            'symbol': symbol,
+            'close': round(close[i], 2),
+            'range': round(cur_r, 2),
+            'sum_prev3_range': round(sum_r, 2),
+            'range_vs_sum': round(range_vs_sum, 2),
+            'volume': int(cur_v),
+            'avg_prev3_volume': int(avg_v),
+            'vol_vs_avg': round(vol_vs_avg, 2),
+            'c1_range': c1,
+            'c2_volume': c2,
+            'strict': c1 and c2,
+            'relaxed': relaxed,
+            'score': round(range_vs_sum * vol_vs_avg, 3),
+        })
+    return rows
 
-            # Last 3 months
-            prev_range_1 = float(prev_month_1['Range'])
-            prev_range_2 = float(prev_month_2['Range'])
-            prev_range_3 = float(prev_month_3['Range'])
 
-            prev_vol_1 = float(prev_month_1['Volume'])
-            prev_vol_2 = float(prev_month_2['Volume'])
-            prev_vol_3 = float(prev_month_3['Volume'])
+TIER_ORDER = {'STRICT': 0, 'RELAXED': 1, 'RANK': 2}
 
-            # Condition 1: Current range > sum of last 3 months' ranges
-            sum_prev_ranges = prev_range_1 + prev_range_2 + prev_range_3
 
-            # Condition 2: Current volume >= 2x average of last 3 months
-            avg_prev_vol = (prev_vol_1 + prev_vol_2 + prev_vol_3) / 3
-            double_avg_vol = avg_prev_vol * 2
+def pick_for_month(rows):
+    """Strict and relaxed hits first; top-scoring filler (tagged RANK) if too few."""
+    picks = []
+    for r in rows:
+        if r['strict']:
+            picks.append({**r, 'tier': 'STRICT'})
+        elif r['relaxed']:
+            picks.append({**r, 'tier': 'RELAXED'})
+    picks.sort(key=lambda r: (TIER_ORDER[r['tier']], -r['score']))
 
-            if current_range > sum_prev_ranges and current_vol >= double_avg_vol:
-                range_ratio = current_range / sum_prev_ranges if sum_prev_ranges > 0 else 0
-                vol_ratio = current_vol / double_avg_vol if double_avg_vol > 0 else 0
+    if len(picks) < MIN_PICKS_PER_MONTH:
+        taken = {p['symbol'] for p in picks}
+        rest = sorted((r for r in rows if r['symbol'] not in taken), key=lambda r: -r['score'])
+        for r in rest[:MIN_PICKS_PER_MONTH - len(picks)]:
+            picks.append({**r, 'tier': 'RANK'})
+    return picks
 
-                breakouts.append({
-                    'Date': data.index[i].strftime('%Y-%m-%d'),
-                    'Price': float(current_month['Close']),
-                    'Range_Ratio': range_ratio,
-                    'Vol_Ratio': vol_ratio,
-                    'Current_Range': current_range,
-                    'Sum_3Mo_Range': sum_prev_ranges,
-                    'Current_Vol': current_vol,
-                    'Double_3Mo_Avg': double_avg_vol
-                })
 
-        return breakouts
-    except Exception as e:
-        print(f"Error scanning {symbol}: {e}")
-        return []
+def run_scan(symbols, start, end):
+    fetch_start = (start - pd.DateOffset(months=LOOKBACK + 1)).strftime('%Y-%m-%d')  # warm-up window
+    fetch_end = (end + pd.Timedelta(days=1)).strftime('%Y-%m-%d')                    # yfinance end is exclusive
+    cutoff = min(pd.Timestamp(date.today()), end)
 
-def send_email(results_df, total_stocks_scanned):
-    """Send email with results"""
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = SENDER_EMAIL
-        msg['To'] = RECIPIENT_EMAIL
-        msg['Subject'] = f"🚀 VCP Breakouts - {datetime.now().strftime('%Y-%m-%d')}"
-        
-        if len(results_df) > 0:
-            html_table = results_df.to_html(index=False)
-            body = f"""
-            <html>
-            <head>
-                <style>
-                    body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                    h2 {{ color: #2ecc71; }}
-                    table {{ border-collapse: collapse; width: 100%; margin-top: 10px; }}
-                    th {{ background-color: #34495e; color: white; padding: 10px; text-align: left; }}
-                    td {{ border: 1px solid #bdc3c7; padding: 8px; }}
-                    tr:nth-child(even) {{ background-color: #ecf0f1; }}
-                    .footer {{ margin-top: 20px; color: #7f8c8d; font-size: 12px; }}
-                </style>
-            </head>
-            <body>
-                <h2>✅ VCP Breakouts Found!</h2>
-                <p><b>Date:</b> {datetime.now().strftime('%Y-%m-%d %H:%M IST')}</p>
-                <p><b>Scanned:</b> {total_stocks_scanned} stocks</p>
-                <p><b>Breakouts:</b> {len(results_df)}</p>
-                {html_table}
-                <div class="footer">
-                    <p>📊 Formula (MONTHLY):</p>
-                    <p>✓ Condition 1: Current Month Range > Sum(Last 3 Months' Ranges)</p>
-                    <p>✓ Condition 2: Current Month Volume ≥ 2x Average(Last 3 Months' Volumes)</p>
-                </div>
-            </body>
-            </html>
-            """
-        else:
-            body = f"""
-            <html>
-            <body style="font-family: Arial, sans-serif; margin: 20px;">
-                <h2>⚠️ No VCP Breakouts Today</h2>
-                <p><b>Date:</b> {datetime.now().strftime('%Y-%m-%d %H:%M IST')}</p>
-                <p><b>Scanned:</b> {total_stocks_scanned} stocks</p>
-            </body>
-            </html>
-            """
-        
-        msg.attach(MIMEText(body, 'html'))
-        
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            server.send_message(msg)
-        
-        print(f"✅ Email sent to {RECIPIENT_EMAIL}")
-        return True
-    except Exception as e:
-        print(f"❌ Email error: {e}")
-        return False
+    rows, failed = [], 0
+    for n, sym in enumerate(symbols, 1):
+        print(f"\r  [{n}/{len(symbols)}] {sym:18s}", end='', flush=True)
+        df = fetch_monthly(sym, fetch_start, fetch_end, cutoff)
+        if df is None:
+            failed += 1
+            continue
+        rows += evaluate(df, sym.replace('.NS', ''), start, end)
+        time.sleep(REQUEST_PAUSE_SEC)
+    print(f"\n  Stocks with usable data: {len(symbols) - failed}/{len(symbols)}")
+    return rows
 
+
+def print_diagnostics(rows):
+    n = len(rows)
+    if n == 0:
+        print("\nNo stock-months evaluated. Check internet access and the date range.")
+        return
+    c1 = sum(r['c1_range'] for r in rows)
+    c2 = sum(r['c2_volume'] for r in rows)
+    both = sum(r['strict'] for r in rows)
+    rel = sum(r['relaxed'] for r in rows)
+    print("\n" + "=" * 70)
+    print("STRICTNESS DIAGNOSTICS (stock-months evaluated)")
+    print("=" * 70)
+    print(f"  Total stock-months          : {n}")
+    print(f"  Range > sum(prev3)          : {c1:5d}  ({100*c1/n:.2f}%)")
+    print(f"  Volume >= 2x avg(prev3)     : {c2:5d}  ({100*c2/n:.2f}%)")
+    print(f"  STRICT (both, your rule)    : {both:5d}  ({100*both/n:.2f}%)")
+    print(f"  RELAXED (range>avg, vol>=1.5x): {rel:5d}  ({100*rel/n:.2f}%)")
+    print("=" * 70)
+
+
+def print_picks(month, picks):
+    counts = {t: sum(p['tier'] == t for p in picks) for t in TIER_ORDER}
+    print(f"\n{month:%Y-%m}  picks={len(picks)}  "
+          f"(STRICT {counts['STRICT']}, RELAXED {counts['RELAXED']}, RANK {counts['RANK']})")
+    for p in picks:
+        print(f"   {p['symbol']:12s} {p['tier']:8s} close {p['close']:>10.2f}  "
+              f"range/sum {p['range_vs_sum']:5.2f}x  vol/avg {p['vol_vs_avg']:5.2f}x  "
+              f"score {p['score']:6.2f}")
+
+
+def send_email(df, subject):
+    sender = os.getenv('SENDER_EMAIL', '')
+    password = os.getenv('SENDER_PASSWORD', '')
+    recipient = os.getenv('RECIPIENT_EMAIL', sender)
+    if not sender or not password:
+        print("Email skipped (SENDER_EMAIL / SENDER_PASSWORD not set)")
+        return
+    msg = MIMEMultipart()
+    msg['From'], msg['To'], msg['Subject'] = sender, recipient, subject
+    msg.attach(MIMEText(df.to_html(index=False), 'html'))
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+        server.login(sender, password)
+        server.send_message(msg)
+    print(f"Email sent to {recipient}")
+
+
+# ----------------------------- MAIN -----------------------------
 def main():
-    DAYS_TO_CHECK = 1
-    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting VCP scan...")
-    print(f"Scanning {len(NSE_STOCKS)} stocks...\n")
-    
-    all_results = []
+    ap = argparse.ArgumentParser(description='VCP monthly screener v2')
+    ap.add_argument('mode', choices=['live', 'backtest'])
+    ap.add_argument('--start', help='YYYY-MM-DD (backtest)')
+    ap.add_argument('--end', help='YYYY-MM-DD (backtest)')
+    args = ap.parse_args()
 
-    for i, symbol in enumerate(NSE_STOCKS):
-        print(f"[{i+1:3d}/{len(NSE_STOCKS)}] {symbol:15s}", end='\r')
-        breakouts = scan_stock(symbol, days_back=DAYS_TO_CHECK)
-
-        for bo in breakouts:
-            all_results.append({
-                'Stock': symbol.replace('.NS', ''),
-                'Date': bo['Date'],
-                'Price': f"₹{bo['Price']:.2f}",
-                'Curr_Range': f"₹{bo['Current_Range']:.2f}",
-                'Sum_3Mo': f"₹{bo['Sum_3Mo_Range']:.2f}",
-                'Range_Check': f"✓ {bo['Range_Ratio']:.2f}x",
-                'Curr_Vol': f"{bo['Current_Vol']:,.0f}",
-                'Req_Vol': f"{bo['Double_3Mo_Avg']:,.0f}",
-                'Vol_Check': f"✓ {bo['Vol_Ratio']:.2f}x"
-            })
-    
-    print(" " * 120)
-    
-    if all_results:
-        df = pd.DataFrame(all_results)
-        df = df.sort_values('Date', ascending=False)
-        print(f"\n✅ Found {len(df)} breakouts!")
+    today = pd.Timestamp(date.today())
+    if args.mode == 'live':
+        start = today.replace(day=1) - pd.DateOffset(months=1)   # last completed month
+        end = today
     else:
-        df = pd.DataFrame()
-        print(f"\n⚠️  No breakouts found today")
-    
-    print("Sending email...")
-    send_email(df, len(NSE_STOCKS))
-    print(f"Done!\n")
+        if not (args.start and args.end):
+            sys.exit("backtest needs --start and --end (YYYY-MM-DD)")
+        start, end = pd.Timestamp(args.start), pd.Timestamp(args.end)
+        if start >= end:
+            sys.exit("start must be before end")
 
-if __name__ == "__main__":
+    print("Loading universe:")
+    symbols = load_universe()
+    print(f"Universe size: {len(symbols)}")
+    print(f"Evaluating completed months {start:%Y-%m} to {end:%Y-%m-%d}")
+
+    rows = run_scan(symbols, start, end)
+    print_diagnostics(rows)
+
+    all_picks = []
+    for month in sorted({r['month'] for r in rows}):
+        month_rows = [r for r in rows if r['month'] == month]
+        picks = pick_for_month(month_rows)
+        print_picks(month, picks)
+        all_picks += [{**p, 'month': f"{month:%Y-%m}"} for p in picks]
+
+    if not all_picks:
+        print("\nNo picks at all.")
+        return
+
+    out = pd.DataFrame(all_picks)[['month', 'symbol', 'tier', 'close', 'range', 'sum_prev3_range',
+                                   'range_vs_sum', 'volume', 'avg_prev3_volume', 'vol_vs_avg',
+                                   'c1_range', 'c2_volume', 'score']]
+    fname = f"vcp_v2_{args.mode}_{pd.Timestamp.now():%Y%m%d_%H%M}.csv"
+    out.to_csv(fname, index=False)
+    print(f"\nSaved: {os.path.abspath(fname)}")
+
+    if args.mode == 'live':
+        send_email(out, f"VCP monthly picks - {today:%Y-%m-%d}")
+
+
+if __name__ == '__main__':
     main()
+        
