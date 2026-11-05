@@ -30,7 +30,7 @@ jobs:
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-        run: python vcp_screener_github.py
+        run: python vcp_screener_github.py live
       
       - name: Upload results
         if: always()
