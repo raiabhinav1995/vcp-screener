@@ -1,0 +1,37 @@
+name: VCP Monthly Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: 'Start date (YYYY-MM-DD)'
+        required: true
+        default: '2024-01-01'
+      end:
+        description: 'End date (YYYY-MM-DD)'
+        required: true
+        default: '2026-10-31'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install yfinance pandas numpy requests
+
+      - name: Run backtest
+        run: python vcp_screener_github.py backtest --start "${{ github.event.inputs.start }}" --end "${{ github.event.inputs.end }}"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcp-backtest-${{ github.event.inputs.start }}-to-${{ github.event.inputs.end }}
+          path: vcp_v2_*.csv
+          if-no-files-found: warn
