@@ -38,7 +38,8 @@ import yfinance as yf
 LOOKBACK = 3                  # months in the comparison window
 STRICT_VOL_MULT = 2.0         # strict: volume >= 2.0 x avg(prev3)
 RELAXED_RANGE_FRAC = 1 / 3    # relaxed: range > (1/3) x sum(prev3) = avg(prev3)
-RELAXED_VOL_MULT = 1.5        # relaxed: volume >= 1.5 x avg(prev3)
+RELAXED_VOL_MULT = 2.0        # relaxed: volume >= 2.0 x avg(prev3)  (+ breakout required)
+RELAXED_LOOSE_VOL_MULT = 1.5  # comparison column only ('loose'), never used for picks
 MIN_PICKS_PER_MONTH = 3       # guarantee at least this many rows per month (RANK fills the gap)
 REQUEST_PAUSE_SEC = 0.1       # be gentle with Yahoo
 
@@ -91,14 +92,15 @@ def load_universe():
 
 # ----------------------------- DATA -----------------------------
 def fetch_monthly(symbol, fetch_start, fetch_end, cutoff):
-    """Monthly OHLCV, keeping only months that fully closed on or before `cutoff`."""
+    """Monthly OHLCV, keeping only months that fully closed on or before `cutoff`.
+    Returns (df, reason). df is None when the stock could not be used."""
     try:
         raw = yf.Ticker(symbol).history(start=fetch_start, end=fetch_end,
                                         interval='1mo', auto_adjust=False)
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, f"exception: {exc}"
     if raw is None or raw.empty:
-        return None
+        return None, "empty response from Yahoo"
 
     df = raw[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
     idx = pd.DatetimeIndex(df.index)
@@ -109,7 +111,9 @@ def fetch_monthly(symbol, fetch_start, fetch_end, cutoff):
     month_end = idx.to_period('M').end_time.normalize()
     closed = np.asarray(month_end <= cutoff)
     df = df[closed]
-    return df if len(df) > LOOKBACK else None
+    if len(df) <= LOOKBACK:
+        return None, f"only {len(df)} completed months"
+    return df, ""
 
 
 # ----------------------------- LOGIC -----------------------------
@@ -117,6 +121,7 @@ def evaluate(df, symbol, start, end):
     """One row per completed month in [start, end] that has LOOKBACK prior months."""
     rows = []
     rng = (df['High'] - df['Low']).to_numpy(dtype=float)
+    highs = df['High'].to_numpy(dtype=float)
     vol = df['Volume'].to_numpy(dtype=float)
     close = df['Close'].to_numpy(dtype=float)
     months = df.index
@@ -134,7 +139,11 @@ def evaluate(df, symbol, start, end):
 
         c1 = cur_r > sum_r                          # range condition (your rule)
         c2 = cur_v >= STRICT_VOL_MULT * avg_v       # volume condition (your rule)
-        relaxed = (cur_r > RELAXED_RANGE_FRAC * sum_r) and (cur_v >= RELAXED_VOL_MULT * avg_v)
+        prior_high = highs[i - LOOKBACK:i].max()
+        breakout = close[i] > prior_high            # closed above resistance (prior 3 months' high)
+        range_ok = cur_r > RELAXED_RANGE_FRAC * sum_r
+        relaxed = range_ok and (cur_v >= RELAXED_VOL_MULT * avg_v) and breakout
+        loose = range_ok and (cur_v >= RELAXED_LOOSE_VOL_MULT * avg_v)
 
         range_vs_sum = cur_r / sum_r
         vol_vs_avg = cur_v / avg_v
@@ -142,6 +151,9 @@ def evaluate(df, symbol, start, end):
             'month': month,
             'symbol': symbol,
             'close': round(close[i], 2),
+            'prior3_high': round(prior_high, 2),
+            'breakout': bool(breakout),
+            'loose': bool(loose),
             'range': round(cur_r, 2),
             'sum_prev3_range': round(sum_r, 2),
             'range_vs_sum': round(range_vs_sum, 2),
@@ -183,16 +195,24 @@ def run_scan(symbols, start, end):
     fetch_end = (end + pd.Timedelta(days=1)).strftime('%Y-%m-%d')                    # yfinance end is exclusive
     cutoff = min(pd.Timestamp(date.today()), end)
 
-    rows, failed = [], 0
+    rows, failed, reasons = [], 0, []
     for n, sym in enumerate(symbols, 1):
         print(f"\r  [{n}/{len(symbols)}] {sym:18s}", end='', flush=True)
-        df = fetch_monthly(sym, fetch_start, fetch_end, cutoff)
+        df, reason = fetch_monthly(sym, fetch_start, fetch_end, cutoff)
         if df is None:
             failed += 1
+            if len(reasons) < 5:
+                reasons.append(f"{sym}: {reason}")
             continue
         rows += evaluate(df, sym.replace('.NS', ''), start, end)
         time.sleep(REQUEST_PAUSE_SEC)
     print(f"\n  Stocks with usable data: {len(symbols) - failed}/{len(symbols)}")
+    if failed == len(symbols):
+        print("  ALL fetches failed. First errors:")
+        for r in reasons:
+            print(f"    {r}")
+        print("  -> Usually Yahoo blocking or rate-limiting, or no internet. Try again later, "
+              "or run: pip install -U yfinance")
     return rows
 
 
@@ -212,7 +232,11 @@ def print_diagnostics(rows):
     print(f"  Range > sum(prev3)          : {c1:5d}  ({100*c1/n:.2f}%)")
     print(f"  Volume >= 2x avg(prev3)     : {c2:5d}  ({100*c2/n:.2f}%)")
     print(f"  STRICT (both, your rule)    : {both:5d}  ({100*both/n:.2f}%)")
-    print(f"  RELAXED (range>avg, vol>=1.5x): {rel:5d}  ({100*rel/n:.2f}%)")
+    brk = sum(r['breakout'] for r in rows)
+    loose = sum(r['loose'] for r in rows)
+    print(f"  Close above prior-3 high    : {brk:5d}  ({100*brk/n:.2f}%)")
+    print(f"  RELAXED (range>avg, vol>=2x, breakout): {rel:5d}  ({100*rel/n:.2f}%)")
+    print(f"  Comparison only (range>avg, vol>=1.5x, no breakout): {loose:5d}  ({100*loose/n:.2f}%)")
     print("=" * 70)
 
 
@@ -245,7 +269,8 @@ def send_email(df, subject):
 # ----------------------------- MAIN -----------------------------
 def main():
     ap = argparse.ArgumentParser(description='VCP monthly screener v2')
-    ap.add_argument('mode', choices=['live', 'backtest'])
+    ap.add_argument('mode', nargs='?', default='live', choices=['live', 'backtest'],
+                    help='live (default): last completed month. backtest: needs --start and --end')
     ap.add_argument('--start', help='YYYY-MM-DD (backtest)')
     ap.add_argument('--end', help='YYYY-MM-DD (backtest)')
     args = ap.parse_args()
@@ -277,12 +302,14 @@ def main():
         all_picks += [{**p, 'month': f"{month:%Y-%m}"} for p in picks]
 
     if not all_picks:
-        print("\nNo picks at all.")
+        print("\nNo stock-months were evaluated, so there is nothing to pick from. "
+              "See the fetch errors above.")
         return
 
-    out = pd.DataFrame(all_picks)[['month', 'symbol', 'tier', 'close', 'range', 'sum_prev3_range',
-                                   'range_vs_sum', 'volume', 'avg_prev3_volume', 'vol_vs_avg',
-                                   'c1_range', 'c2_volume', 'score']]
+    out = pd.DataFrame(all_picks)[['month', 'symbol', 'tier', 'close', 'prior3_high', 'breakout',
+                                   'range', 'sum_prev3_range', 'range_vs_sum', 'volume',
+                                   'avg_prev3_volume', 'vol_vs_avg', 'c1_range', 'c2_volume',
+                                   'loose', 'score']]
     fname = f"vcp_v2_{args.mode}_{pd.Timestamp.now():%Y%m%d_%H%M}.csv"
     out.to_csv(fname, index=False)
     print(f"\nSaved: {os.path.abspath(fname)}")
@@ -293,4 +320,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-        
+                           
