@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 MINERVINI SEPA / VCP BREAKOUT SCREENER (NSE)
@@ -72,7 +73,14 @@ MAX_LAST_DEPTH = 0.10    # last pullback <= 10%
 MAX_CHASE = 0.05         # close <= pivot x 1.05
 VOL_MA = 50              # volume average used for dry-up and breakout
 BREAKOUT_VOL_MULT = 1.4  # ASSUMPTION (see header)
-STOP_PCT = 0.08          # risk shown in output
+STOP_PCT = 0.08          # stop used in output and in the *_stop backtest columns
+
+# GRADE A (from the Nov 2026 analysis of 336 signals, 2021-2026; improved results in both
+# the 2021-24 and the 2024-26 halves). Grade B signals are still listed, ranked below A.
+#  - last pullback >= 30% of the first one (e.g. 20/6 ok, 30/5 not: first drop too deep)
+#  - at most 2 contractions (3-4 contraction bases here were longer, deeper, and did worse)
+GRADE_A_MIN_RATIO = 0.30
+GRADE_A_MAX_CONTRACTIONS = 2
 
 HORIZONS = {'1m': 21, '3m': 63, '6m': 126}
 BENCH = '^NSEI'
@@ -125,7 +133,7 @@ def fetch_daily(symbol, start, end):
         return None, f"exception: {exc}"
     if raw is None or raw.empty:
         return None, "empty response from Yahoo"
-    df = raw[['High', 'Low', 'Close', 'Volume']].copy()
+    df = raw[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
     idx = pd.DatetimeIndex(df.index)
     if idx.tz is not None:
         idx = idx.tz_localize(None)
@@ -218,6 +226,7 @@ def scan_symbol(sym, df, rs, start, end, bench):
     high = df['High'].to_numpy(float)
     low = df['Low'].to_numpy(float)
     close = df['Close'].to_numpy(float)
+    opn = df['Open'].to_numpy(float)
     vol = df['Volume'].to_numpy(float)
     dates = df.index
     n = len(df)
@@ -240,8 +249,12 @@ def scan_symbol(sym, df, rs, start, end, bench):
         if info is None:
             continue
         last = i
+        depths = [float(x) for x in info['depths_pct'].split('/')]
+        tight_ratio = depths[-1] / depths[0] if depths[0] > 0 else 0
+        grade = 'A' if (tight_ratio >= GRADE_A_MIN_RATIO and info['contractions'] <= GRADE_A_MAX_CONTRACTIONS) else 'B'
         row = {
             'symbol': sym.replace('.NS', ''),
+            'grade': grade,
             'signal_date': d.date(),
             'close': round(close[i], 2),
             'pivot': info['pivot'],
@@ -261,6 +274,18 @@ def scan_symbol(sym, df, rs, start, end, bench):
             else:
                 row[h] = np.nan
                 row['bench_' + h] = np.nan
+            # Same horizon, but sold at the 8% stop if a later day's low touches it
+            # (at the open instead, if the stock gaps below the stop).
+            stop = close[i] * (1 - STOP_PCT)
+            exit_px, hit = np.nan, False
+            for k in range(i + 1, min(j, n - 1) + 1):
+                if low[k] <= stop:
+                    exit_px, hit = min(stop, opn[k]), True
+                    break
+            if not hit and j < n:
+                exit_px = close[j]
+            row[h + '_stop'] = round((exit_px / close[i] - 1) * 100, 2) if not np.isnan(exit_px) else np.nan
+            row[h + '_stopped'] = hit if not np.isnan(exit_px) else np.nan
         out.append(row)
     return out
 
@@ -274,16 +299,21 @@ def summarize(res):
     print("RESULTS (forward returns from signal-day close; Nifty 50 over the same dates)")
     print("=" * 78)
     print(f"Signals per month:\n{res.groupby(pd.to_datetime(res.signal_date).dt.to_period('M')).size().to_string()}\n")
-    for h in HORIZONS:
-        s = res[h].dropna()
-        if s.empty:
-            print(f"  {h}: no signals with a full forward window yet")
-            continue
-        b = res['bench_' + h].dropna()
-        ex = (res[h] - res['bench_' + h]).dropna()
-        print(f"  {h}: n={len(s):4d}  made money={(s > 0).mean() * 100:5.1f}%  "
-              f"avg={s.mean():6.2f}%  median={s.median():6.2f}%  | Nifty avg={b.mean():5.2f}%  "
-              f"beat Nifty={(ex > 0).mean() * 100:5.1f}%  avg excess={ex.mean():6.2f}%")
+    for label, sub in [("ALL", res), ("GRADE A", res[res.grade == 'A']), ("GRADE B", res[res.grade == 'B'])]:
+        print(f"\n{label}: {len(sub)} signals")
+        for h in HORIZONS:
+            s = sub[h].dropna()
+            if s.empty:
+                print(f"  {h}: no signals with a full forward window yet")
+                continue
+            b = sub['bench_' + h].dropna()
+            ex = (sub[h] - sub['bench_' + h]).dropna()
+            ws = sub[h + '_stop'].dropna()
+            print(f"  {h}: n={len(s):4d}  made money={(s > 0).mean() * 100:5.1f}%  "
+                  f"avg={s.mean():6.2f}%  median={s.median():6.2f}%  | Nifty avg={b.mean():5.2f}%  "
+                  f"beat Nifty={(ex > 0).mean() * 100:5.1f}%")
+            print(f"       with 8% stop: made money={(ws > 0).mean() * 100:5.1f}%  avg={ws.mean():6.2f}%  "
+                  f"median={ws.median():6.2f}%  stopped out={sub[h + '_stopped'].dropna().astype(bool).mean() * 100:5.1f}%")
     print("=" * 78)
 
 
@@ -371,7 +401,10 @@ def main():
     if args.mode == 'live':
         print(f"\nSignals in the last 5 days: {len(res)}")
         if not res.empty:
-            print(res.drop(columns=[c for c in res.columns if c.startswith('bench_') or c in HORIZONS]).to_string(index=False))
+            res = res.drop(columns=[c for c in res.columns
+                                    if c.startswith('bench_') or c.split('_')[0] in HORIZONS])
+            res = res.sort_values(['grade', 'rs_rank'], ascending=[True, False]).reset_index(drop=True)
+            print(res.to_string(index=False))
     else:
         summarize(res)
 
