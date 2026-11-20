@@ -119,7 +119,8 @@ def load_universe():
 def fetch_daily(symbol, start, end):
     """Daily OHLCV. Returns (df, reason). df is None if unusable."""
     try:
-        raw = yf.Ticker(symbol).history(start=start, end=end, interval='1d', auto_adjust=False)
+        # auto_adjust=True: prices adjusted for splits/bonuses, so a split is not read as a crash
+        raw = yf.Ticker(symbol).history(start=start, end=end, interval='1d', auto_adjust=True)
     except Exception as exc:
         return None, f"exception: {exc}"
     if raw is None or raw.empty:
